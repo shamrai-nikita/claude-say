@@ -85,6 +85,11 @@ final class Controller: NSObject, NSApplicationDelegate {
         item.menu = menu
         redraw()
         speakCurrent()
+
+        // Docs and testing: open the panel by itself, so a screenshot can catch it.
+        if ProcessInfo.processInfo.environment["SAY_MENU_OPEN"] == "1" {
+            onMain(after: 0.6) { self.item.button?.performClick(nil) }
+        }
     }
 
     func split(_ text: String) -> [String] {
@@ -153,6 +158,25 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     // MARK: playback
 
+    // The main queue does not run while a menu tracks events, so a plain
+    // DispatchQueue.main call would stall playback whenever the panel is open.
+    // These two helpers run in the tracking mode too.
+
+    /// Thread safe: callable from a process termination handler.
+    func onMain(_ block: @escaping () -> Void) {
+        let modes = [CFRunLoopMode.commonModes.rawValue,
+                     RunLoop.Mode.eventTracking.rawValue as CFString] as CFArray
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), modes, block)
+        CFRunLoopWakeUp(CFRunLoopGetMain())
+    }
+
+    /// Main thread only.
+    func onMain(after delay: TimeInterval, _ block: @escaping () -> Void) {
+        let t = Timer(timeInterval: delay, repeats: false) { _ in block() }
+        RunLoop.main.add(t, forMode: .common)
+        RunLoop.main.add(t, forMode: .eventTracking)
+    }
+
     func speakCurrent() {
         guard index < sentences.count else { NSApp.terminate(nil); return }
         let p = Process()
@@ -163,7 +187,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         let stdin = Pipe()
         p.standardInput = stdin
         p.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async { self?.finished() }
+            self?.onMain { self?.finished() }
         }
         guard (try? p.run()) != nil else { NSApp.terminate(nil); return }
         stdin.fileHandleForWriting.write(sentences[index].data(using: .utf8) ?? Data())
@@ -189,7 +213,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// Replay the current sentence — used after a speed, voice, or position change.
     func restartCurrent() {
         killCurrent()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { self.speakCurrent() }
+        onMain(after: 0.12) { self.speakCurrent() }
     }
 
     // MARK: actions

@@ -28,13 +28,16 @@ without needing to hear the audio:
 say -l                                   # turns found in this session
 say -t | head                            # cleaned text
 printf 'One. Two. Три предложение.' > "$TMPDIR/t.txt"
-bin/say-menu "$TMPDIR/t.txt" &           # launch the player
+SAY_MENU_OPEN=1 bin/say-menu "$TMPDIR/t.txt" &   # launch, panel opens itself
 ps -o args= -p "$(pgrep -x say | head -1)"   # which voice and rate it chose
 pgrep -x say-menu || echo "exited"       # it must quit after the last sentence
 say --stop
 ```
 
 `ps -o args=` on the child is the main check: it shows `-r <wpm>` and `-v <voice>`.
+The player deletes the text file after reading it, so write a fresh one per run.
+`SAY_MENU_OPEN=1` opens the panel at launch, for screenshots and for checking
+that playback keeps advancing while the menu is open.
 
 ## Rules
 
@@ -51,7 +54,11 @@ say --stop
 6. **One process per sentence** is what makes a live speed or voice change
    possible. Do not batch sentences without saying so — the user chose the
    gaps over losing the live controls.
-7. Update `README.md` when behaviour changes, including a new corner case.
+7. **Never call `DispatchQueue.main` for playback callbacks.** The main queue
+   does not run while the menu tracks events, so playback stalls as soon as the
+   user opens the panel. Use `onMain(_:)` and `onMain(after:_:)`, which run in
+   `.eventTracking` too. This bug shipped once and was caught with the panel open.
+8. Update `README.md` when behaviour changes, including a new corner case.
 
 ## Where things live in the Swift file
 

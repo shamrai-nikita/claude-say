@@ -2,6 +2,8 @@
 
 Listen to a Claude Code response instead of reading it. You pick which one.
 
+![The menu bar player](docs/player.png)
+
 Type `!say` in Claude Code: the previous response is spoken aloud and a player
 appears in the menu bar. It disappears when the text ends. Nothing speaks on its
 own — no hooks, no daemon, no microphone.
