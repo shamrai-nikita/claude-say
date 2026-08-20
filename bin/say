@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Speak a Claude Code response aloud, with a menu bar player.
+
+  say           speak the last response
+  say 3         speak the 3rd-from-last response
+  say -l        list the last 10 responses, so you can pick a number
+  say -t        print the cleaned text, do not speak
+  say --stop    stop playback and remove the menu bar item
+
+Anything else (text arguments, system flags, piped input) is passed straight
+to /usr/bin/say, so the built-in command keeps working.
+"""
+import argparse, glob, json, os, re, stat, subprocess, sys
+
+HOME = os.path.expanduser("~")
+MENU = os.path.join(os.path.dirname(os.path.realpath(__file__)), "say-menu")
+OURS = {"-l", "--list", "-t", "--text", "--stop", "-h", "--help"}
+
+
+def forward():
+    os.execv("/usr/bin/say", ["say"] + sys.argv[1:])
+
+
+def is_ours():
+    for a in sys.argv[1:]:
+        if a in OURS:
+            continue
+        if re.fullmatch(r"\d+", a):
+            continue
+        return False
+    if not sys.argv[1:]:
+        try:
+            m = os.fstat(0).st_mode
+            if stat.S_ISFIFO(m) or stat.S_ISREG(m):
+                return False  # `cat file | say` — that is the system command
+        except OSError:
+            pass
+    return True
+
+
+def cwd_of(path):
+    """The working directory a transcript belongs to, read from its first entries."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for _ in range(20):
+                line = fh.readline()
+                if not line:
+                    break
+                d = json.loads(line).get("cwd")
+                if d:
+                    return d
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def transcript_path():
+    here = os.getcwd()
+    slug = here.replace("/", "-").replace("_", "-").replace(".", "-")
+    d = os.path.join(HOME, ".claude", "projects", slug)
+    files = sorted(glob.glob(os.path.join(d, "*.jsonl")), key=os.path.getmtime, reverse=True)
+    for f in files:                       # the folder name matched, confirm the directory
+        if cwd_of(f) in (here, None):
+            return f
+    # folder naming changed, or this session started elsewhere: search every project
+    everything = sorted(glob.glob(os.path.join(HOME, ".claude", "projects", "*", "*.jsonl")),
+                        key=os.path.getmtime, reverse=True)
+    for f in everything[:80]:
+        if cwd_of(f) == here:
+            return f
+    # a subdirectory of a session: accept the nearest parent that has one
+    parents = [here]
+    while parents[-1] not in ("/", os.path.dirname(parents[-1])):
+        parents.append(os.path.dirname(parents[-1]))
+    for f in everything[:80]:
+        c = cwd_of(f)
+        if c and c in parents:
+            return f
+    if files:
+        return files[0]
+    sys.exit(f"say: no Claude Code transcript found for {here}")
+
+
+def is_user_prompt(e):
+    if e.get("type") != "user" or e.get("isMeta") or e.get("isSidechain"):
+        return False
+    c = e.get("message", {}).get("content")
+    if isinstance(c, str):
+        return True
+    if isinstance(c, list):
+        return not any(b.get("type") == "tool_result" for b in c if isinstance(b, dict))
+    return False
+
+
+def turns(path):
+    out, buf = [], []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if is_user_prompt(e):
+                if buf:
+                    out.append("\n\n".join(buf))
+                buf = []
+                continue
+            if e.get("type") != "assistant" or e.get("isSidechain"):
+                continue
+            for b in e.get("message", {}).get("content", []):
+                if isinstance(b, dict) and b.get("type") == "text":
+                    t = b.get("text", "").strip()
+                    if t:
+                        buf.append(t)
+    if buf:
+        out.append("\n\n".join(buf))
+    return out
+
+
+def clean(md):
+    t = re.sub(r"```[\s\S]*?```", " . code block skipped . ", md)
+    t = re.sub(r"`([^`]*)`", r"\1", t)
+    t = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", t)
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.M)
+    t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.M)
+    t = re.sub(r"^\s*\|.*\|\s*$", " ", t, flags=re.M)
+    t = re.sub(r"\*\*([^*]*)\*\*", r"\1", t)
+    t = re.sub(r"(?<!\w)[*_]([^*_]+)[*_](?!\w)", r"\1", t)
+    t = re.sub(r"^\s*[-=]{3,}\s*$", " ", t, flags=re.M)
+    t = "".join(ch for ch in t if ch.isascii() or ch.isalnum())
+    t = re.sub(r"[ \t]+", " ", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
+
+
+def stop():
+    a = subprocess.run(["pkill", "-x", "say-menu"], capture_output=True).returncode == 0
+    b = subprocess.run(["pkill", "-x", "say"], capture_output=True).returncode == 0
+    print("stopped" if a or b else "nothing was speaking")
+
+
+if not is_ours():
+    forward()
+
+if "--stop" in sys.argv[1:]:
+    stop()
+    sys.exit(0)
+
+p = argparse.ArgumentParser(prog="say", description=__doc__,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
+p.add_argument("n", nargs="?", type=int, default=1, help="1 = last response")
+p.add_argument("-l", "--list", action="store_true")
+p.add_argument("-t", "--text", action="store_true")
+a = p.parse_args()
+
+ts = turns(transcript_path())
+if not ts:
+    sys.exit("say: no assistant responses in this session yet")
+
+if a.list:
+    for i, t in enumerate(reversed(ts[-10:]), 1):
+        print(f"{i:>2}: {clean(t).splitlines()[0][:90]}")
+    sys.exit(0)
+
+if a.n > len(ts):
+    sys.exit(f"say: only {len(ts)} responses in this session")
+
+text = clean(ts[-a.n])
+if a.text:
+    print(text)
+    sys.exit(0)
+
+subprocess.run(["pkill", "-x", "say-menu"], capture_output=True)
+tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), "say-menu-text.txt")
+with open(tmp, "w", encoding="utf-8") as fh:
+    fh.write(text)
+subprocess.Popen([MENU, tmp], start_new_session=True,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+words = len(text.split())
+print(f"Speaking response -{a.n} ({words} words). Controls: menu bar 🔊 icon. Stop: say --stop")
