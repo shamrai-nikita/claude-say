@@ -14,7 +14,8 @@ own — no hooks, no daemon, no microphone.
 git clone https://github.com/shamrai-nikita/claude-say && cd claude-say && ./install.sh
 ```
 
-macOS, Xcode Command Line Tools, `~/.local/bin` on PATH. No other dependencies.
+macOS, Xcode Command Line Tools, `~/.local/bin` on PATH. Neural voices also need
+[`uv`](https://docs.astral.sh/uv/); without it the player uses macOS voices.
 
 ## Use
 
@@ -29,14 +30,33 @@ macOS, Xcode Command Line Tools, `~/.local/bin` on PATH. No other dependencies.
 Player: back / play-pause / stop / skip a sentence, speed 0.75x–2x, voice, and a
 progress bar. Speed and voice are remembered.
 
-Each sentence picks its own voice: Cyrillic text switches to a Russian voice,
-everything else uses your system voice.
+**Voices.** The default is a neural voice, Andrew Multilingual: it reads Russian
+with English terms inside naturally. Pick another one under **Voice** in the player:
+
+- **Neural voices** (online): Andrew, Ava, Brian, Emma (multilingual), Dmitry,
+  Svetlana (Russian). The text goes to Microsoft's Edge Read Aloud service, with
+  no account; Microsoft says it deletes the text right after conversion.
+- **Offline — Silero**: neural Russian voice on this Mac, nothing is sent. English
+  words are rewritten in Cyrillic first, so they sound rougher. First use
+  downloads torch (a few hundred MB) and a 145 MB model.
+- **macOS voices**: the old engine. Cyrillic sentences use a Russian voice, the
+  rest your system voice. No network.
+
+If a neural render fails (offline, service down), that sentence uses the macOS voice.
+
+Tables are read row by row: "Header: value, Header: value". File paths are
+shortened to the file name, URLs become "link".
+
+`speak` is the same engine on its own: `speak "текст"`, `pbpaste | speak`,
+`speak --local "..."` (offline), `speak --print` (show the cleaned text).
 
 ## How it works
 
 `bin/say` reads the session transcript in `~/.claude/projects/`, strips
-markdown, and launches `bin/say-menu` — an AppKit status item that runs
-`/usr/bin/say` once per sentence. One process per sentence is what makes a live
+markdown, and launches `bin/say-menu` — an AppKit status item that plays one
+sentence per process. With a neural voice it renders each sentence to a file
+with `bin/speak` (two sentences ahead) and plays it with `afplay`; with a macOS
+voice it runs `/usr/bin/say`. One process per sentence is what makes a live
 speed or voice change possible.
 
 `say` shadows `/usr/bin/say` on PATH and forwards anything that is not its own

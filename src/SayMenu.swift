@@ -1,8 +1,11 @@
 import Cocoa
 
-// Playback runs through /usr/bin/say, one sentence per process, so the voice is
-// the same system voice the plain `say` command uses. AVSpeechSynthesizer only
-// reaches the compact voices, which sound robotic.
+// Two engines, one sentence per process either way:
+//  - neural: bin/speak renders each sentence to an audio file (Microsoft neural
+//    voices online, or Silero offline), a few sentences ahead, and afplay plays it.
+//  - system: /usr/bin/say, the same voices the plain `say` command uses.
+//    AVSpeechSynthesizer only reaches the compact voices, which sound robotic.
+// A sentence the neural engine fails to render falls back to the system engine.
 
 let PREFS = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".claude/say-prefs.json")
@@ -17,6 +20,24 @@ let SKIP: Set<String> = ["Albert", "Bad News", "Bahh", "Bells", "Boing", "Bubble
                          "Ralph", "Fred", "Kathy", "Princess", "Bruce", "Agnes", "Victoria"]
 
 let CYRILLIC_LANGS = ["ru", "uk", "be", "bg", "sr", "mk"]
+
+/// bin/speak, next to this binary.
+let SPEAK = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    .deletingLastPathComponent().appendingPathComponent("speak").path
+
+/// Neural voices. Multilingual ones read Russian with English terms inside well.
+/// "local" is Silero: offline, nothing leaves the machine.
+let NEURAL: [(id: String, title: String)] = [
+    ("en-US-AndrewMultilingualNeural", "Andrew — multilingual"),
+    ("en-US-AvaMultilingualNeural", "Ava — multilingual"),
+    ("en-US-BrianMultilingualNeural", "Brian — multilingual"),
+    ("en-US-EmmaMultilingualNeural", "Emma — multilingual"),
+    ("ru-RU-DmitryNeural", "Dmitry — ru"),
+    ("ru-RU-SvetlanaNeural", "Svetlana — ru"),
+    ("local", "Offline — Silero, ru (nothing sent)"),
+]
+/// Sentences rendered ahead of the one playing, so there is no gap between them.
+let PREFETCH = 2
 
 struct Voice {
     let name: String
@@ -58,6 +79,18 @@ final class Controller: NSObject, NSApplicationDelegate {
     var proc: Process?
     var killed = false               // true while we stop a process on purpose
 
+    // neural engine
+    let hasSpeak = FileManager.default.isExecutableFile(atPath: SPEAK)
+    var engine = "neural"            // "neural" or "system"
+    var neuralVoice = NEURAL[0].id
+    var audio: [Int: String] = [:]   // sentence index -> rendered file
+    var rendering: [Int: Process] = [:]
+    var noAudio: Set<Int> = []       // render failed: system voice for these
+    var generation = 0               // bumped on a voice change, drops stale renders
+    var waiting = false              // the current sentence is still rendering
+    let workDir = NSTemporaryDirectory() + "say-menu-\(getpid())"
+    var termSource: DispatchSourceSignal?
+
     // player controls
     var playButton: NSButton!
     var speedControl: NSSegmentedControl!
@@ -70,7 +103,15 @@ final class Controller: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)
         loadPrefs()
+        if !hasSpeak { engine = "system" }
         voices = readVoices()
+        try? FileManager.default.createDirectory(atPath: workDir, withIntermediateDirectories: true)
+
+        // `say --stop` sends SIGTERM: quit cleanly, so afplay and the renders stop too.
+        signal(SIGTERM, SIG_IGN)
+        termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
+        termSource?.setEventHandler { [weak self] in self?.onMain { NSApp.terminate(nil) } }
+        termSource?.resume()
 
         let path = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : ""
         guard let raw = try? String(contentsOfFile: path, encoding: .utf8), !raw.isEmpty else {
@@ -145,10 +186,12 @@ final class Controller: NSObject, NSApplicationDelegate {
         if let s = j["speed"] as? Double { speed = Float(s) }
         if let v = j["voice"] as? String, !v.isEmpty { voiceLatin = v }
         if let v = j["voice_cyrillic"] as? String, !v.isEmpty { voiceCyrillic = v }
+        if let e = j["engine"] as? String, e == "system" || e == "neural" { engine = e }
+        if let v = j["neural_voice"] as? String, NEURAL.contains(where: { $0.id == v }) { neuralVoice = v }
     }
 
     func savePrefs() {
-        var j: [String: Any] = ["speed": Double(speed)]
+        var j: [String: Any] = ["speed": Double(speed), "engine": engine, "neural_voice": neuralVoice]
         if let v = voiceLatin { j["voice"] = v }
         if let v = voiceCyrillic { j["voice_cyrillic"] = v }
         if let d = try? JSONSerialization.data(withJSONObject: j, options: .prettyPrinted) {
@@ -177,24 +220,95 @@ final class Controller: NSObject, NSApplicationDelegate {
         RunLoop.main.add(t, forMode: .eventTracking)
     }
 
+    var usesNeural: Bool { engine == "neural" && !noAudio.contains(index) }
+
     func speakCurrent() {
         guard index < sentences.count else { NSApp.terminate(nil); return }
+        if usesNeural {
+            prefetch()
+            guard let file = audio[index] else { waiting = true; redraw(); return }
+            waiting = false
+            play("/usr/bin/afplay", ["-q", "1", "-r", String(speed), file], input: nil)
+        } else {
+            waiting = false
+            var args = ["-r", String(Int(BASE_WPM * speed))]
+            if let v = voiceFor(sentences[index]) { args += ["-v", v] }
+            play("/usr/bin/say", args, input: sentences[index])
+        }
+    }
+
+    func play(_ exe: String, _ args: [String], input: String?) {
         let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        var args = ["-r", String(Int(BASE_WPM * speed))]
-        if let v = voiceFor(sentences[index]) { args += ["-v", v] }
+        p.executableURL = URL(fileURLWithPath: exe)
         p.arguments = args
         let stdin = Pipe()
-        p.standardInput = stdin
+        if input != nil { p.standardInput = stdin }
         p.terminationHandler = { [weak self] _ in
             self?.onMain { self?.finished() }
         }
         guard (try? p.run()) != nil else { NSApp.terminate(nil); return }
-        stdin.fileHandleForWriting.write(sentences[index].data(using: .utf8) ?? Data())
-        stdin.fileHandleForWriting.closeFile()
+        if let text = input {
+            stdin.fileHandleForWriting.write(text.data(using: .utf8) ?? Data())
+            stdin.fileHandleForWriting.closeFile()
+        }
         proc = p
         paused = false
         redraw()
+    }
+
+    // MARK: neural rendering
+
+    func prefetch() {
+        for i in index..<min(index + 1 + PREFETCH, sentences.count)
+            where audio[i] == nil && rendering[i] == nil && !noAudio.contains(i) {
+            render(i)
+        }
+    }
+
+    func render(_ i: Int) {
+        let gen = generation
+        let local = neuralVoice == "local"
+        let file = workDir + "/\(gen)-\(i)." + (local ? "wav" : "mp3")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: SPEAK)
+        p.arguments = ["--raw", "-o", file] + (local ? ["--local"] : ["-v", neuralVoice])
+            + ["--", sentences[i]]
+        // speak is a uv script: make sure uv is found even with a thin PATH.
+        var env = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "/usr/bin:/bin")
+        p.environment = env
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        p.terminationHandler = { [weak self] pr in
+            let ok = pr.terminationStatus == 0
+            self?.onMain { self?.rendered(i, gen, file, ok) }
+        }
+        guard (try? p.run()) != nil else { noAudio.insert(i); return }
+        rendering[i] = p
+    }
+
+    func rendered(_ i: Int, _ gen: Int, _ file: String, _ ok: Bool) {
+        guard gen == generation else { try? FileManager.default.removeItem(atPath: file); return }
+        rendering[i] = nil
+        if ok && FileManager.default.fileExists(atPath: file) { audio[i] = file } else { noAudio.insert(i) }
+        if waiting && i == index { speakCurrent() }
+    }
+
+    /// Drop every rendered or rendering sentence, after a voice change.
+    func resetAudio() {
+        generation += 1
+        rendering.values.forEach { $0.terminate() }
+        rendering.removeAll()
+        audio.values.forEach { try? FileManager.default.removeItem(atPath: $0) }
+        audio.removeAll()
+        noAudio.removeAll()
+    }
+
+    func applicationWillTerminate(_ note: Notification) {
+        killCurrent()
+        rendering.values.forEach { $0.terminate() }
+        try? FileManager.default.removeItem(atPath: workDir)
     }
 
     func finished() {
@@ -246,9 +360,19 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     /// Tags: -1 = system voice for Latin, -2 = automatic Cyrillic voice,
-    /// 0..999 = a Latin voice, 1000+ = a Cyrillic voice.
+    /// 0..999 = a Latin voice, 1000..1999 = a Cyrillic voice, 2000+ = a neural voice.
     @objc func setVoice(_ sender: NSMenuItem) {
         let t = sender.tag
+        if t >= 2000 {
+            engine = "neural"
+            neuralVoice = NEURAL[t - 2000].id
+            resetAudio()
+            savePrefs()
+            restartCurrent()
+            return
+        }
+        let wasNeural = usesNeural
+        engine = "system"
         let cyrillic = t == -2 || t >= 1000
         if cyrillic {
             voiceCyrillic = t == -2 ? nil : voices[t - 1000].name
@@ -257,7 +381,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
         savePrefs()
         redraw()
-        if isCyrillic(sentences[index]) == cyrillic { restartCurrent() }
+        if wasNeural || isCyrillic(sentences[index]) == cyrillic { restartCurrent() }
     }
 
     // MARK: menu
@@ -337,14 +461,18 @@ final class Controller: NSObject, NSApplicationDelegate {
         voiceMenu.addItem(mi)
     }
 
-    /// One menu, two sections: the voice for Latin text and the voice for Cyrillic text.
+    /// Neural voices first, then the macOS voices: one for Latin text, one for Cyrillic.
     func buildVoiceMenu() {
-        header(voiceMenu, "Latin text")
+        if hasSpeak {
+            header(voiceMenu, "Neural voices")
+            for (i, v) in NEURAL.enumerated() { voiceEntry(v.title, tag: 2000 + i) }
+        }
+        header(voiceMenu, "macOS voice, Latin text")
         voiceEntry("System voice (Spoken Content)", tag: -1)
         for (i, v) in voices.enumerated() where !v.isCyrillic {
             voiceEntry("\(v.name) — \(v.lang)", tag: i)
         }
-        header(voiceMenu, "Cyrillic text")
+        header(voiceMenu, "macOS voice, Cyrillic text")
         voiceEntry("Best installed voice", tag: -2)
         for (i, v) in voices.enumerated() where v.isCyrillic {
             voiceEntry("\(v.name) — \(v.lang)", tag: i + 1000)
@@ -363,16 +491,21 @@ final class Controller: NSObject, NSApplicationDelegate {
         progressBar.maxValue = Double(sentences.count)
         progressBar.doubleValue = Double(index + 1)
 
-        let voiceName = voiceFor(sentences[index]) ?? "system voice"
+        let neuralName = NEURAL.first(where: { $0.id == neuralVoice })?.title
+            .components(separatedBy: " —").first ?? neuralVoice
+        let voiceName = waiting ? "loading…"
+            : usesNeural ? neuralName : (voiceFor(sentences[index]) ?? "system voice")
         progressLabel.stringValue = "Sentence \(index + 1) of \(sentences.count) · \(voiceName)"
 
+        let system = engine == "system"
         for mi in voiceMenu.items where mi.action != nil {
             let t = mi.tag
             switch t {
-            case -1: mi.state = voiceLatin == nil ? .on : .off
-            case -2: mi.state = voiceCyrillic == nil ? .on : .off
-            case 1000...: mi.state = voices[t - 1000].name == voiceCyrillic ? .on : .off
-            default: mi.state = voices[t].name == voiceLatin ? .on : .off
+            case 2000...: mi.state = !system && NEURAL[t - 2000].id == neuralVoice ? .on : .off
+            case -1: mi.state = system && voiceLatin == nil ? .on : .off
+            case -2: mi.state = system && voiceCyrillic == nil ? .on : .off
+            case 1000...: mi.state = system && voices[t - 1000].name == voiceCyrillic ? .on : .off
+            default: mi.state = system && voices[t].name == voiceLatin ? .on : .off
             }
         }
     }

@@ -47,6 +47,22 @@ real thing with certainty, call `/usr/bin/say` by full path.
 Voice names hold spaces and brackets — `say -v "Milena (Enhanced)"` needs the
 quotes in a shell. The Swift app passes argv directly, so it needs none.
 
+### It reads with the old macOS voice instead of the neural one
+
+- `uv` is not on PATH, or `bin/speak` is not executable: the player hides the
+  neural voices. Check `command -v uv` and `ls -l bin/speak`.
+- No network, or the service failed: each failed sentence falls back to the
+  macOS voice. Test by hand: `speak -o /tmp/t.mp3 "проверка" && afplay /tmp/t.mp3`.
+- `edge-tts` uses an unofficial endpoint. When Microsoft changes it, update the
+  package: `uv cache clean edge-tts`, then run `speak` again.
+- You picked a macOS voice earlier: choose a neural voice under **Voice**.
+
+### A long pause before the first sentence
+
+The first neural sentence is rendered before playback starts: about 1-2 seconds.
+The next ones are rendered while the current one plays. The offline Silero voice
+loads torch on each render; its first run ever also downloads the model.
+
 ### Every sentence flies past with no sound
 
 A voice saved in `~/.claude/say-prefs.json` no longer exists — you deleted it in
@@ -79,7 +95,7 @@ pkill -CONT -x say ; pkill -x say
 
 ### Pause reacts late
 
-Pause is `SIGSTOP` on the `say` process. Audio already inside the CoreAudio
+Pause is `SIGSTOP` on the `say` or `afplay` process. Audio already inside the CoreAudio
 buffer keeps playing for about a quarter second, then stops. There is no way
 around it short of a different speech engine.
 
@@ -115,5 +131,8 @@ If `swiftc` is missing, run `xcode-select --install` first.
 
 ### Nothing survives that I should worry about?
 
-No background process, no launch agent, no network access. `!say` starts a
-process that exits when the text ends or when you press Stop.
+No background process, no launch agent. `!say` starts a process that exits
+when the text ends or when you press Stop. A neural voice sends each sentence
+to Microsoft (see README); choose the offline Silero voice or a macOS voice to
+send nothing. Rendered audio lives in `$TMPDIR/say-menu-<pid>/` and is deleted
+when the player quits.

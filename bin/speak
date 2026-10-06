@@ -1,0 +1,178 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["edge-tts>=7"]
+# ///
+"""Read text aloud: Russian, English, or a mix of both.
+
+  speak "текст"            text as arguments
+  pbpaste | speak          text from stdin (markdown and tables are cleaned)
+  speak --local "текст"    fully offline (Silero), nothing leaves the machine
+  speak -r +15% "текст"    faster speech (cloud mode)
+  speak -o out.mp3 "..."   save to a file instead of playing (.wav with --local)
+
+Cloud mode sends the text to Microsoft's Edge Read Aloud service.
+Use --local for anything confidential.
+"""
+
+import argparse
+import asyncio
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import queue
+
+DEFAULT_VOICE = "en-US-AndrewMultilingualNeural"
+LOCAL_HELPER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "speak-local.py")
+
+
+# ---------- text cleaning ----------
+
+def _table_to_speech(lines):
+    rows = []
+    for ln in lines:
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if all(re.fullmatch(r":?-{2,}:?", c) or c == "" for c in cells):
+            continue
+        rows.append(cells)
+    if not rows:
+        return ""
+    header, body = rows[0], rows[1:]
+    if not body:
+        return ". ".join(c for c in header if c) + "."
+    out = []
+    for r in body:
+        parts = []
+        for i, c in enumerate(r):
+            if not c:
+                continue
+            h = header[i] if i < len(header) else ""
+            parts.append(f"{h}: {c}" if h else c)
+        out.append(", ".join(parts) + ".")
+    return "\n".join(out)
+
+
+def clean(text: str) -> str:
+    text = re.sub(r"```.*?```", "\n(блок кода пропущен)\n", text, flags=re.S)
+    text = re.sub(r"<[^>\n]+>", " ", text)  # html-ish tags
+
+    lines, out, table = text.splitlines(), [], []
+    for ln in lines + [""]:
+        if re.match(r"^\s*\|.*\|\s*$", ln):
+            table.append(ln)
+            continue
+        if table:
+            out.append(_table_to_speech(table))
+            table = []
+        out.append(ln)
+    text = "\n".join(out)
+
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)      # images
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)        # links
+    text = re.sub(r"https?://\S+", "ссылка", text)
+    text = re.sub(r"`([^`]*)`", r"\1", text)                    # inline code
+    # long paths -> last component
+    text = re.sub(r"(?:~|\.|[\w.\-]+)?(?:/[\w.\-]+){2,}/?", lambda m: m.group(0).rstrip("/").rsplit("/", 1)[-1], text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)   # headers
+    text = re.sub(r"^\s*>\s?", "", text, flags=re.M)            # quotes
+    text = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", text, flags=re.M)  # bullets
+    text = re.sub(r"^\s*([-*_]\s*){3,}$", "", text, flags=re.M)  # hr
+    text = re.sub(r"(\*\*|__|\*|~~)(.+?)\1", r"\2", text)
+    text = text.replace("→", " в ").replace("=>", " в ").replace("->", " в ")
+    text = re.sub(r"[ \t]+", " ", text)
+    # a line without final punctuation gets a period, so the voice pauses
+    text = "\n".join(
+        (l.strip() + ("" if re.search(r"[.!?:;,…]$", l.strip()) else "."))
+        for l in text.splitlines() if l.strip()
+    )
+    return text.strip()
+
+
+def chunks(text: str, limit: int = 600):
+    """Split on paragraphs, then sentences, so playback starts fast."""
+    buf = ""
+    for para in text.split("\n"):
+        for sent in re.split(r"(?<=[.!?…])\s+", para):
+            if buf and len(buf) + len(sent) > limit:
+                yield buf
+                buf = ""
+            buf = f"{buf} {sent}".strip()
+        if len(buf) > limit // 3:
+            yield buf
+            buf = ""
+    if buf:
+        yield buf
+
+
+# ---------- cloud (edge-tts) ----------
+
+def _player(q: "queue.Queue[str | None]"):
+    while (path := q.get()) is not None:
+        subprocess.run(["afplay", path])
+        os.unlink(path)
+
+
+async def speak_cloud(text, voice, rate, outfile):
+    import edge_tts
+
+    if outfile:
+        await edge_tts.Communicate(text, voice, rate=rate).save(outfile)
+        return
+    q: "queue.Queue[str | None]" = queue.Queue()
+    t = threading.Thread(target=_player, args=(q,), daemon=True)
+    t.start()
+    try:
+        for part in chunks(text):
+            fd, path = tempfile.mkstemp(suffix=".mp3", prefix="speak-")
+            os.close(fd)
+            await edge_tts.Communicate(part, voice, rate=rate).save(path)
+            q.put(path)
+    finally:
+        q.put(None)
+        t.join()
+
+
+def speak_local(text, outfile=None):
+    env = dict(os.environ, SPEAK_OUT=outfile) if outfile else None
+    subprocess.run(["uv", "run", "--quiet", "--script", LOCAL_HELPER], input=text.encode(), check=True, env=env)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("text", nargs="*")
+    p.add_argument("--local", action="store_true", help="offline Silero voice, nothing is sent anywhere")
+    p.add_argument("-v", "--voice", default=os.environ.get("SPEAK_VOICE", DEFAULT_VOICE))
+    p.add_argument("-r", "--rate", default=os.environ.get("SPEAK_RATE", "+0%"), help="e.g. +15%%, -10%%")
+    p.add_argument("-o", "--out", help="save audio instead of playing (mp3, or wav with --local)")
+    p.add_argument("--raw", action="store_true", help="skip markdown cleaning")
+    p.add_argument("--print", action="store_true", help="only print the cleaned text")
+    a = p.parse_args()
+
+    text = " ".join(a.text) if a.text else sys.stdin.read()
+    if not a.raw:
+        text = clean(text)
+    if not text:
+        return
+    if a.print:
+        print(text)
+        return
+    try:
+        if a.local or os.environ.get("SPEAK_LOCAL") == "1":
+            speak_local(text, a.out)
+        else:
+            try:
+                asyncio.run(speak_cloud(text, a.voice, a.rate, a.out))
+            except Exception as e:  # offline or service broken
+                if a.out:  # the caller handles its own fallback
+                    sys.exit(f"speak: cloud failed ({e.__class__.__name__})")
+                print(f"speak: cloud failed ({e.__class__.__name__}), using local voice", file=sys.stderr)
+                speak_local(text)
+    except KeyboardInterrupt:
+        subprocess.run(["pkill", "-x", "afplay"])
+
+
+if __name__ == "__main__":
+    main()

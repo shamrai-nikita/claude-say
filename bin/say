@@ -117,14 +117,44 @@ def turns(path):
     return out
 
 
+def table_row(line, header):
+    """One table row as a phrase: "Header: value, Header: value." """
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    if all(re.fullmatch(r":?-{2,}:?", c) or not c for c in cells):
+        return None                                   # the |---|---| line
+    if header is None:
+        return cells
+    parts = [f"{header[i]}: {c}" if i < len(header) and header[i] else c
+             for i, c in enumerate(cells) if c]
+    return ", ".join(parts) + "."
+
+
+def tables(md):
+    out, header = [], None
+    for line in md.split("\n"):
+        if not re.fullmatch(r"\s*\|.*\|\s*", line):
+            out.append(line)
+            header = None
+            continue
+        if header is None:
+            header = table_row(line, None)
+            continue
+        row = table_row(line, header)
+        if row:
+            out.append(row)
+    return "\n".join(out)
+
+
 def clean(md):
     t = re.sub(r"```[\s\S]*?```", " . code block skipped . ", md)
+    t = tables(t)
     t = re.sub(r"`([^`]*)`", r"\1", t)
     t = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", t)
     t = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", t)
+    t = re.sub(r"https?://\S+", " link ", t)
+    t = re.sub(r"(?:~|\.|[\w.\-]+)?(?:/[\w.\-]+){2,}/?", lambda m: m.group(0).rstrip("/").rsplit("/", 1)[-1], t)  # path -> file name
     t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.M)
     t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.M)
-    t = re.sub(r"^\s*\|.*\|\s*$", " ", t, flags=re.M)
     t = re.sub(r"\*\*([^*]*)\*\*", r"\1", t)
     t = re.sub(r"(?<!\w)[*_]([^*_]+)[*_](?!\w)", r"\1", t)
     t = re.sub(r"^\s*[-=]{3,}\s*$", " ", t, flags=re.M)
