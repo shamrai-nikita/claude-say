@@ -9,15 +9,19 @@ Read `README.md` first: it holds the user-facing behaviour and a long
 - `bin/say` — Python 3 launcher, standard library only. Reads the session
   transcript, cleans markdown (tables become "Header: value" phrases), launches
   the player. Also forwards to `/usr/bin/say` when the invocation is not its own.
-- `bin/speak` — uv script (edge-tts). Renders text with a Microsoft neural voice,
-  `-o file` for the player; plays chunks itself when run by hand.
+- `bin/speak` — uv script (edge-tts, num2words). Renders text with a Microsoft
+  neural voice, `-o file` for the player; plays chunks itself when run by hand.
+  `pronounce()` runs on every text, `--raw` included: the user's rules from
+  `~/.config/claude-say/pronounce.txt`, then "4-й"-style numbers to words.
+  Voice `auto` picks Dmitry for text with any Russian word, Andrew otherwise.
 - `bin/speak-local.py` — uv script (torch, Silero v5). Offline Russian voice for
   `speak --local`. Model cached in `~/.local/share/speak/`.
 - `src/SayMenu.swift` — the menu bar app. Single file, AppKit, no packages.
 - `bin/say-menu` — build output, git ignored.
 - `install.sh` — build plus symlinks into `~/.local/bin`.
 - `~/.claude/say-prefs.json` — speed, `engine` (`neural`/`system`),
-  `neural_voice` (an edge-tts id or `local`), `voice` (Latin), `voice_cyrillic`.
+  `neural_voice` (`auto`, an edge-tts id, or `local`), `voice` (Latin),
+  `voice_cyrillic`.
 
 ## Build and check
 

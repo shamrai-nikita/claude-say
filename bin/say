@@ -92,8 +92,20 @@ def is_user_prompt(e):
     return False
 
 
+def prompt_text(e):
+    c = e.get("message", {}).get("content")
+    if isinstance(c, list):
+        c = next((b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"), "")
+    return (c or "").lstrip()
+
+
+# `!say` itself lands in the chat, and Claude often answers it ("You ran say...").
+# That answer is not what the user wants read, so it is not a turn.
+SAY_RUN = re.compile(r"<bash-input>\s*(?:\S*/)?(?:say|say-last)(?:\s|<)")
+
+
 def turns(path):
-    out, buf = [], []
+    out, buf, skip = [], [], False
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             try:
@@ -101,9 +113,13 @@ def turns(path):
             except ValueError:
                 continue
             if is_user_prompt(e):
-                if buf:
+                t = prompt_text(e)
+                if t.startswith(("<bash-stdout>", "<bash-stderr>")):
+                    continue                  # output of the `!command` just before
+                if buf and not skip:
                     out.append("\n\n".join(buf))
                 buf = []
+                skip = bool(SAY_RUN.match(t))
                 continue
             if e.get("type") != "assistant" or e.get("isSidechain"):
                 continue
@@ -112,7 +128,7 @@ def turns(path):
                     t = b.get("text", "").strip()
                     if t:
                         buf.append(t)
-    if buf:
+    if buf and not skip:
         out.append("\n\n".join(buf))
     return out
 

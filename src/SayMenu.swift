@@ -25,9 +25,12 @@ let CYRILLIC_LANGS = ["ru", "uk", "be", "bg", "sr", "mk"]
 let SPEAK = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
     .deletingLastPathComponent().appendingPathComponent("speak").path
 
-/// Neural voices. Multilingual ones read Russian with English terms inside well.
+/// Neural voices. "auto" lets bin/speak pick per sentence: Dmitry for Russian,
+/// Andrew for English. The multilingual voices read Russian with an accent as
+/// soon as an English word is in the sentence ("ждёт" comes out as "ждиет").
 /// "local" is Silero: offline, nothing leaves the machine.
 let NEURAL: [(id: String, title: String)] = [
+    ("auto", "Auto — Dmitry for Russian, Andrew for English"),
     ("en-US-AndrewMultilingualNeural", "Andrew — multilingual"),
     ("en-US-AvaMultilingualNeural", "Ava — multilingual"),
     ("en-US-BrianMultilingualNeural", "Brian — multilingual"),
@@ -135,10 +138,18 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     func split(_ text: String) -> [String] {
         var out: [String] = []
+        var marker = ""   // a list number such as "1." waits for the sentence after it
         text.enumerateSubstrings(in: text.startIndex..., options: .bySentences) { s, _, _, _ in
             let t = (s ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !t.isEmpty { out.append(t) }
+            if t.isEmpty { return }
+            if t.range(of: "^\\d{1,3}[.)]$", options: .regularExpression) != nil {
+                marker += t + " "
+                return
+            }
+            out.append(marker + t)
+            marker = ""
         }
+        if !marker.isEmpty { out.append(marker.trimmingCharacters(in: .whitespaces)) }
         return out.isEmpty ? [text] : out
     }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["edge-tts>=7"]
+# dependencies = ["edge-tts>=7", "num2words>=0.5.13"]
 # ///
 """Read text aloud: Russian, English, or a mix of both.
 
@@ -13,6 +13,9 @@
 
 Cloud mode sends the text to Microsoft's Edge Read Aloud service.
 Use --local for anything confidential.
+
+Pronunciation fixes: "4-й" is read as "четвёртый", "в 3-х" as "в трёх", and
+your own replacements come from ~/.config/claude-say/pronounce.txt.
 """
 
 import argparse
@@ -25,8 +28,25 @@ import tempfile
 import threading
 import queue
 
-DEFAULT_VOICE = "en-US-AndrewMultilingualNeural"
+# "auto": text with any Russian word -> Dmitry, the rest -> Andrew. The multilingual Andrew
+# reads Russian with an accent once an English word is in the sentence.
+DEFAULT_VOICE = "auto"
+VOICE_RU = "ru-RU-DmitryNeural"
+VOICE_EN = "en-US-AndrewMultilingualNeural"
 LOCAL_HELPER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "speak-local.py")
+DICTIONARY = os.path.expanduser("~/.config/claude-say/pronounce.txt")
+DICTIONARY_HEADER = """\
+# How speak (and !say) should pronounce words. One rule per line:
+#
+#   word = how to say it        whole word, any letter case
+#   re: regex = replacement     a Python regex, \\1 refers to a group
+#
+# Lines starting with # are comments. Rules run top to bottom, before the voice.
+# Check a rule without listening: speak --print "text"
+#
+# k8s = кубернетис
+# re: (\\d+)\\s*мс = \\1 миллисекунд
+"""
 
 
 # ---------- text cleaning ----------
@@ -91,6 +111,79 @@ def clean(text: str) -> str:
     return text.strip()
 
 
+# ---------- pronunciation ----------
+
+# Suffix after "4-": (ordinal or cardinal, num2words options).
+# "-х", "-ти", "-ми" are cardinal in everyday writing: "из 3-х" = "из трёх".
+SUFFIXES = {
+    "й": ("o", {}), "ый": ("o", {}), "ий": ("o", {}),
+    "я": ("o", {"gender": "f"}), "ая": ("o", {"gender": "f"}), "ья": ("o", {"gender": "f"}),
+    "е": ("o", {"gender": "n"}), "ое": ("o", {"gender": "n"}), "ье": ("o", {"gender": "n"}),
+    "го": ("o", {"case": "genitive"}), "ого": ("o", {"case": "genitive"}),
+    "му": ("o", {"case": "dative"}), "ому": ("o", {"case": "dative"}),
+    "ом": ("o", {"case": "prepositional"}),
+    "ым": ("o", {"case": "instrumental"}),
+    "ой": ("o", {"gender": "f", "case": "genitive"}),
+    "ю": ("o", {"gender": "f", "case": "accusative"}), "ую": ("o", {"gender": "f", "case": "accusative"}),
+    "ые": ("o", {"plural": True}), "ых": ("o", {"plural": True, "case": "genitive"}),
+    "ыми": ("o", {"plural": True, "case": "instrumental"}),
+    "х": ("c", {"case": "genitive"}), "ти": ("c", {"case": "genitive"}),
+    "ми": ("c", {"case": "instrumental"}),
+}
+PREP_WORDS = {"в", "во", "на", "о", "об", "при"}
+
+
+def _number_with_suffix(m):
+    from num2words import num2words
+
+    before, num, suf = m.group(1), int(m.group(2)), m.group(3).lower()
+    if suf == "м":  # "в 4-м" -> четвёртом, "с 4-м" -> четвёртым
+        prev = re.findall(r"[а-яё]+", before.lower())
+        kind, kw = "o", {"case": "prepositional" if prev and prev[-1] in PREP_WORDS else "instrumental"}
+    else:
+        kind, kw = SUFFIXES[suf]
+    try:
+        word = num2words(num, lang="ru", to="ordinal" if kind == "o" else "cardinal", **kw)
+    except Exception:
+        return m.group(0)
+    return before + word
+
+
+def load_dictionary():
+    if not os.path.exists(DICTIONARY):
+        try:
+            os.makedirs(os.path.dirname(DICTIONARY), exist_ok=True)
+            with open(DICTIONARY, "w", encoding="utf-8") as fh:
+                fh.write(DICTIONARY_HEADER)
+        except OSError:
+            pass
+        return []
+    rules = []
+    with open(DICTIONARY, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            src, dst = (x.strip() for x in line.rsplit("=", 1))
+            try:
+                if src.startswith("re:"):
+                    rules.append((re.compile(src[3:].strip()), dst))
+                else:
+                    rules.append((re.compile(rf"(?<!\w){re.escape(src)}(?!\w)", re.I), dst.replace("\\", "\\\\")))
+            except re.error as e:
+                print(f"speak: bad rule in {DICTIONARY}: {line} ({e})", file=sys.stderr)
+    return rules
+
+
+def pronounce(text: str) -> str:
+    """Rewrite what voices get wrong. Runs on every text, cleaned or --raw."""
+    for rx, dst in load_dictionary():
+        text = rx.sub(dst, text)
+    suf = "|".join(sorted(list(SUFFIXES) + ["м"], key=len, reverse=True))
+    text = re.sub(rf"((?:^|\W)(?:[а-яёА-ЯЁ]+\s+)?)(\d+)\s*-\s*({suf})(?![а-яё])", _number_with_suffix, text)
+    return text
+
+
 def chunks(text: str, limit: int = 600):
     """Split on paragraphs, then sentences, so playback starts fast."""
     buf = ""
@@ -115,11 +208,22 @@ def _player(q: "queue.Queue[str | None]"):
         os.unlink(path)
 
 
+def pick_voice(voice, text):
+    if voice != "auto":
+        return voice
+    # Any Russian word -> Dmitry. Andrew switches the whole sentence to English
+    # as soon as the English part is long ("NASA-328 даёт ему кнопку Start refund").
+    # Text with no English word ("1.", "16") is Russian too: Andrew says "one".
+    if re.search(r"[а-яёА-ЯЁ]{2,}", text) or not re.search(r"[a-zA-Z]{2,}", text):
+        return VOICE_RU
+    return VOICE_EN
+
+
 async def speak_cloud(text, voice, rate, outfile):
     import edge_tts
 
     if outfile:
-        await edge_tts.Communicate(text, voice, rate=rate).save(outfile)
+        await edge_tts.Communicate(text, pick_voice(voice, text), rate=rate).save(outfile)
         return
     q: "queue.Queue[str | None]" = queue.Queue()
     t = threading.Thread(target=_player, args=(q,), daemon=True)
@@ -128,7 +232,7 @@ async def speak_cloud(text, voice, rate, outfile):
         for part in chunks(text):
             fd, path = tempfile.mkstemp(suffix=".mp3", prefix="speak-")
             os.close(fd)
-            await edge_tts.Communicate(part, voice, rate=rate).save(path)
+            await edge_tts.Communicate(part, pick_voice(voice, part), rate=rate).save(path)
             q.put(path)
     finally:
         q.put(None)
@@ -144,7 +248,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("text", nargs="*")
     p.add_argument("--local", action="store_true", help="offline Silero voice, nothing is sent anywhere")
-    p.add_argument("-v", "--voice", default=os.environ.get("SPEAK_VOICE", DEFAULT_VOICE))
+    p.add_argument("-v", "--voice", default=os.environ.get("SPEAK_VOICE", DEFAULT_VOICE),
+                   help="auto (Dmitry for Russian, Andrew for English) or an edge-tts voice id")
     p.add_argument("-r", "--rate", default=os.environ.get("SPEAK_RATE", "+0%"), help="e.g. +15%%, -10%%")
     p.add_argument("-o", "--out", help="save audio instead of playing (mp3, or wav with --local)")
     p.add_argument("--raw", action="store_true", help="skip markdown cleaning")
@@ -154,6 +259,7 @@ def main():
     text = " ".join(a.text) if a.text else sys.stdin.read()
     if not a.raw:
         text = clean(text)
+    text = pronounce(text)
     if not text:
         return
     if a.print:

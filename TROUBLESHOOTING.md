@@ -20,6 +20,10 @@ breaks the parse. Fix is in `turns()` and `is_user_prompt()`.
 
 ### It speaks the wrong response
 
+- **Claude answered your `!say`.** `!say` lands in the chat and Claude often
+  comments on it ("You ran say..."). Those comments are skipped: a reply to a
+  `!say` is never a turn, so the real answer stays at `-1`.
+
 - **Two Claude sessions in the same folder.** The launcher confirms the `cwd`
   field inside each transcript, then takes the most recently written match.
   With two live sessions in one directory, that can be the other one.
@@ -56,6 +60,13 @@ quotes in a shell. The Swift app passes argv directly, so it needs none.
 - `edge-tts` uses an unofficial endpoint. When Microsoft changes it, update the
   package: `uv cache clean edge-tts`, then run `speak` again.
 - You picked a macOS voice earlier: choose a neural voice under **Voice**.
+
+### A Russian word sounds wrong ("ждёт" as "ждиет")
+
+The multilingual voices (Andrew, Ava, Brian, Emma) read Russian with an English
+accent when the sentence holds an English word or acronym. Use **Auto** or
+**Dmitry**. For one word read wrong by every voice, add a rule to
+`~/.config/claude-say/pronounce.txt`.
 
 ### A long pause before the first sentence
 
